@@ -15,6 +15,7 @@ target/
 
 # Python
 __pycache__/
+__pycache__*
 .pycache/
 .pytest_cache/
 .ruff_cache/
@@ -25,7 +26,7 @@ __pycache__/
 *.dylib
 *.pdb
 
-# Generated type bindings (committed only for strands-py/src/strands/_generated.py)
+# Generated type bindings (committed only for strands-py-wasm/src/strands/_generated.py)
 strands-ts/generated/
 strands-wasm/generated/
 
@@ -33,7 +34,10 @@ strands-wasm/generated/
 coverage/
 
 # IDE files
-.kiro/
+.claude/*
+!.claude/skills
+.kiro/*
+!.kiro/skills
 .vscode/
 .idea/
 *.swp
@@ -61,13 +65,14 @@ Thumbs.db
 **/test/.artifacts
 
 # Misc
+*.bak
 *.backup
 **/mutants.out*/
 bin/
 
 # LLM
 CLAUDE.md
-.claude
+.claude/settings.local.json
 
 # dev
 .vitest*

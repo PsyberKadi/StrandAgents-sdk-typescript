@@ -60,6 +60,12 @@ export interface TasksConfig {
 /** Connection state of an MCP client. */
 export type McpConnectionState = 'disconnected' | 'connected' | 'failed'
 
+/** Options for MCP tool invocation. */
+export interface McpCallToolOptions {
+  /** AbortSignal to cancel the in-flight request. */
+  signal?: AbortSignal
+}
+
 /** OAuth client credentials for machine-to-machine authentication. */
 export interface McpClientCredentials {
   clientId: string
@@ -68,23 +74,8 @@ export interface McpClientCredentials {
   scopes?: string[]
 }
 
-/** Arguments for configuring an MCP Client. */
-export type McpClientConfig = RuntimeConfig & {
-  /** Pre-constructed transport. Mutually exclusive with `url`. */
-  transport?: McpTransport
-
-  /** Server URL. When provided, a StreamableHTTP transport is constructed automatically. */
-  url?: string | URL
-
-  /** Client credentials for OAuth machine-to-machine auth. Requires `url`. */
-  auth?: McpClientCredentials
-
-  /** Custom OAuth provider for advanced auth flows. Requires `url`. Mutually exclusive with `auth`. */
-  authProvider?: OAuthClientProvider
-
-  /** Custom headers to include on every request to the server. Requires `url`. */
-  headers?: Record<string, string>
-
+/** Behavioral options shared by all MCP client configurations. */
+export interface McpClientOptions extends RuntimeConfig {
   /** Disable OpenTelemetry MCP instrumentation. */
   disableMcpInstrumentation?: boolean
 
@@ -103,10 +94,28 @@ export type McpClientConfig = RuntimeConfig & {
   elicitationCallback?: ElicitationCallback
 
   /** When true, connection failures are logged as warnings instead of throwing. */
-  failOpen?: boolean
+  continueOnError?: boolean
 
   /** Called when the server emits a log message. Defaults to routing through the Strands logger. */
   logHandler?: (params: LoggingMessageNotificationParams) => void
+}
+
+/** Arguments for configuring an MCP Client. */
+export type McpClientConfig = McpClientOptions & {
+  /** Pre-constructed transport. Mutually exclusive with `url`. */
+  transport?: McpTransport
+
+  /** Server URL. When provided, a StreamableHTTP transport is constructed automatically. */
+  url?: string | URL
+
+  /** Client credentials for OAuth machine-to-machine auth. Requires `url`. */
+  auth?: McpClientCredentials
+
+  /** Custom OAuth provider for advanced auth flows. Requires `url`. Mutually exclusive with `auth`. */
+  authProvider?: OAuthClientProvider
+
+  /** Custom headers to include on every request to the server. Requires `url`. */
+  headers?: Record<string, string>
 }
 
 /** MCP Client for interacting with Model Context Protocol servers. */
@@ -122,7 +131,7 @@ export class McpClient {
   private _transport: Transport
   private _state: McpConnectionState
   private _client: Client
-  private _failOpen: boolean
+  private _continueOnError: boolean
   private _logHandler: (params: LoggingMessageNotificationParams) => void
   private _disableMcpInstrumentation: boolean
   private _tasksConfig: TasksConfig | undefined
@@ -137,7 +146,7 @@ export class McpClient {
     this._clientVersion = args.applicationVersion || '0.0.1'
     this._transport = McpClient._resolveTransport(args)
     this._state = 'disconnected'
-    this._failOpen = args.failOpen ?? false
+    this._continueOnError = args.continueOnError ?? false
     this._logHandler = args.logHandler ?? defaultLogHandler
     this._tasksConfig = args.tasksConfig
     this._elicitationCallback = args.elicitationCallback
@@ -195,12 +204,10 @@ export class McpClient {
       : args.authProvider
 
     const url = args.url instanceof URL ? args.url : new URL(args.url!)
-    return new StreamableHTTPClientTransport(
-      url,
-      authProvider || args.headers
-        ? { ...(authProvider && { authProvider }), ...(args.headers && { requestInit: { headers: args.headers } }) }
-        : undefined
-    ) as Transport
+    return new StreamableHTTPClientTransport(url, {
+      ...(authProvider && { authProvider }),
+      ...(args.headers && { requestInit: { headers: args.headers } }),
+    }) as Transport
   }
 
   get client(): Client {
@@ -223,10 +230,18 @@ export class McpClient {
     return this._state
   }
 
+  get clientName(): string {
+    return this._clientName
+  }
+
+  get continueOnError(): boolean {
+    return this._continueOnError
+  }
+
   /**
    * Connects the MCP client to the server.
    *
-   * Called lazily before any operation that requires a connection. When `failOpen` is true,
+   * Called lazily before any operation that requires a connection. When `continueOnError` is true,
    * connection failures are swallowed and the client enters a `'failed'` state — subsequent
    * calls are no-ops until `connect(true)` is called explicitly to retry.
    *
@@ -252,10 +267,10 @@ export class McpClient {
       await this._client.connect(this._transport)
       this._state = 'connected'
     } catch (error) {
-      if (!this._failOpen) throw error
+      if (!this._continueOnError) throw error
       this._state = 'failed'
       logger.warn(
-        `client=<${this._clientName}>, error=<${error}> | MCP server failed to connect, continuing with failOpen`
+        `client=<${this._clientName}>, error=<${error}> | MCP server failed to connect, continuing (continueOnError)`
       )
     }
   }
@@ -356,14 +371,15 @@ export class McpClient {
    *
    * @param tool - The McpTool instance to invoke.
    * @param args - The arguments to pass to the tool.
+   * @param options - Optional settings for the request.
    * @returns A promise that resolves with the result of the tool invocation.
    */
-  public async callTool(tool: McpTool, args: JSONValue): Promise<JSONValue> {
+  public async callTool(tool: McpTool, args: JSONValue, options?: McpCallToolOptions): Promise<JSONValue> {
     await this.connect()
     if (this._state === 'failed') throw new Error('MCP server failed to connect. Call connect(true) to retry.')
 
     if (args === null || args === undefined) {
-      return await this.callTool(tool, {})
+      return await this.callTool(tool, {}, options)
     }
 
     if (typeof args !== 'object' || Array.isArray(args)) {
@@ -378,20 +394,17 @@ export class McpClient {
 
     // When tasksConfig is undefined, call tools directly without task management
     if (this._tasksConfig === undefined) {
-      return (await this._client.callTool({ name: tool.name, arguments: toolArgs })) as JSONValue
+      return (await this._client.callTool({ name: tool.name, arguments: toolArgs }, undefined, options)) as JSONValue
     }
 
     // When tasksConfig is defined (even as empty object), use task-based invocation
     // which supports long-running tools with progress tracking
-    const stream = this._client.experimental.tasks.callToolStream(
-      { name: tool.name, arguments: toolArgs },
-      undefined, // resultSchema - use default CallToolResultSchema
-      {
-        timeout: this._tasksConfig.ttl ?? McpClient.DEFAULT_TTL,
-        maxTotalTimeout: this._tasksConfig.pollTimeout ?? McpClient.DEFAULT_POLL_TIMEOUT,
-        resetTimeoutOnProgress: true,
-      }
-    )
+    const stream = this._client.experimental.tasks.callToolStream({ name: tool.name, arguments: toolArgs }, undefined, {
+      timeout: this._tasksConfig.ttl ?? McpClient.DEFAULT_TTL,
+      maxTotalTimeout: this._tasksConfig.pollTimeout ?? McpClient.DEFAULT_POLL_TIMEOUT,
+      resetTimeoutOnProgress: true,
+      ...options,
+    })
 
     const result = await takeResult(stream)
     return result as JSONValue

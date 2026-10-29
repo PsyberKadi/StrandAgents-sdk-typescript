@@ -336,11 +336,45 @@ describe('MCP Integration', () => {
       await client.callTool(tool, { op: 'add' })
 
       expect(sdkClientMock.connect).toHaveBeenCalled()
-      expect(sdkClientMock.callTool).toHaveBeenCalledWith({
-        name: 'calc',
-        arguments: { op: 'add' },
-      })
+      expect(sdkClientMock.callTool).toHaveBeenCalledWith(
+        { name: 'calc', arguments: { op: 'add' } },
+        undefined,
+        undefined
+      )
       expect(sdkClientMock.experimental.tasks.callToolStream).not.toHaveBeenCalled()
+    })
+
+    it('forwards abort signal to SDK callTool', async () => {
+      const tool = new McpTool({ name: 'calc', description: '', inputSchema: {}, client })
+      sdkClientMock.callTool.mockResolvedValue({ content: [] })
+      const controller = new AbortController()
+
+      await client.callTool(tool, { op: 'add' }, { signal: controller.signal })
+
+      expect(sdkClientMock.callTool).toHaveBeenCalledWith({ name: 'calc', arguments: { op: 'add' } }, undefined, {
+        signal: controller.signal,
+      })
+    })
+
+    it('forwards abort signal to callToolStream when tasksConfig is provided', async () => {
+      const resultsLengthBefore = vi.mocked(Client).mock.results.length
+      const taskClient = new McpClient({
+        applicationName: 'TestApp',
+        transport: mockTransport,
+        tasksConfig: {},
+      })
+      const taskSdkClientMock = vi.mocked(Client).mock.results[resultsLengthBefore]!.value
+      const tool = new McpTool({ name: 'calc', description: '', inputSchema: {}, client: taskClient })
+      taskSdkClientMock.experimental.tasks.callToolStream.mockReturnValue(createMockCallToolStream({ content: [] })())
+      const controller = new AbortController()
+
+      await taskClient.callTool(tool, { op: 'add' }, { signal: controller.signal })
+
+      expect(taskSdkClientMock.experimental.tasks.callToolStream).toHaveBeenCalledWith(
+        { name: 'calc', arguments: { op: 'add' } },
+        undefined,
+        { timeout: 60000, maxTotalTimeout: 300000, resetTimeoutOnProgress: true, signal: controller.signal }
+      )
     })
 
     it('uses callToolStream when tasksConfig is provided (empty object)', async () => {
@@ -647,12 +681,28 @@ describe('MCP Integration', () => {
 
     const toolContext: ToolContext = {
       toolUse: { toolUseId: 'id-123', name: 'weather', input: { city: 'NYC' } },
-      agent: {} as LocalAgent,
+      agent: { cancelSignal: new AbortController().signal } as LocalAgent,
       invocationState: {},
       interrupt: () => {
         throw new Error('interrupt not available in mock context')
       },
     }
+
+    it('forwards agent cancelSignal to callTool', async () => {
+      vi.mocked(mockClientWrapper.callTool).mockResolvedValue({
+        content: [{ type: 'text', text: 'ok' }],
+      })
+
+      await runTool<ToolResultBlock>(tool.stream(toolContext))
+
+      expect(mockClientWrapper.callTool).toHaveBeenCalledWith(
+        tool,
+        { city: 'NYC' },
+        {
+          signal: toolContext.agent.cancelSignal,
+        }
+      )
+    })
 
     it('returns text results on success', async () => {
       vi.mocked(mockClientWrapper.callTool).mockResolvedValue({
@@ -1009,7 +1059,7 @@ describe('server metadata getters', () => {
   })
 })
 
-describe('failOpen', () => {
+describe('continueOnError', () => {
   let sdkClientMock: {
     connect: ReturnType<typeof vi.fn>
     listTools: ReturnType<typeof vi.fn>
@@ -1037,17 +1087,17 @@ describe('failOpen', () => {
     await expect(client.connect()).rejects.toThrow('connection refused')
   })
 
-  it('swallows connection failure when failOpen is true', async () => {
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+  it('swallows connection failure when continueOnError is true', async () => {
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValue(new Error('connection refused'))
 
     await expect(client.connect()).resolves.toBeUndefined()
   })
 
-  it('logs a warning when failOpen swallows a connection failure', async () => {
+  it('logs a warning when continueOnError swallows a connection failure', async () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValue(new Error('connection refused'))
 
@@ -1056,8 +1106,8 @@ describe('failOpen', () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('MCP server failed to connect'))
   })
 
-  it('listTools returns empty array when failOpen and connection failed', async () => {
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+  it('listTools returns empty array when continueOnError and connection failed', async () => {
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValue(new Error('connection refused'))
 
@@ -1066,8 +1116,8 @@ describe('failOpen', () => {
     expect(tools).toEqual([])
   })
 
-  it('callTool throws when failOpen and connection failed', async () => {
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+  it('callTool throws when continueOnError and connection failed', async () => {
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValue(new Error('connection refused'))
     const tool = new McpTool({ name: 'my_tool', description: '', inputSchema: {}, client })
@@ -1077,8 +1127,8 @@ describe('failOpen', () => {
     )
   })
 
-  it('does not retry connection on subsequent calls after failOpen failure', async () => {
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+  it('does not retry connection on subsequent calls after continueOnError failure', async () => {
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValue(new Error('connection refused'))
 
@@ -1089,7 +1139,7 @@ describe('failOpen', () => {
   })
 
   it('recovers after explicit connect(true) when server comes back', async () => {
-    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, failOpen: true })
+    const client = new McpClient({ applicationName: 'TestApp', transport: mockTransport, continueOnError: true })
     sdkClientMock = vi.mocked(Client).mock.results.at(-1)!.value
     sdkClientMock.connect.mockRejectedValueOnce(new Error('connection refused'))
     sdkClientMock.listTools.mockResolvedValue({ tools: [] })
@@ -1205,7 +1255,7 @@ describe('McpClient transport resolution', () => {
 
   it('constructs StreamableHTTPClientTransport when url is provided', () => {
     new McpClient({ url: 'https://mcp.example.com' })
-    expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(new URL('https://mcp.example.com'), undefined)
+    expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(new URL('https://mcp.example.com'), {})
   })
 
   it('constructs ClientCredentialsProvider when auth is provided', () => {
@@ -1267,7 +1317,7 @@ describe('McpClient transport resolution', () => {
   it('accepts URL instance for url field', () => {
     const url = new URL('https://mcp.example.com/path')
     new McpClient({ url })
-    expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(url, undefined)
+    expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(url, {})
   })
 
   it('passes headers as requestInit to transport', () => {

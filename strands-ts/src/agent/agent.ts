@@ -15,6 +15,7 @@ import {
   type ContentBlockData,
   Message,
   type MessageData,
+  type StopReason,
   type SystemPrompt,
   type SystemPromptData,
   TextBlock,
@@ -36,6 +37,9 @@ import { ToolRegistry } from '../registry/tool-registry.js'
 import { StateStore } from '../state-store.js'
 import { AgentPrinter, getDefaultAppender, type Printer } from './printer.js'
 import type { Plugin } from '../plugins/plugin.js'
+import type { InterventionHandler } from '../interventions/handler.js'
+import { InterventionRegistry } from '../interventions/registry.js'
+import type { LifecycleObserver } from '../types/lifecycle-observer.js'
 import { PluginRegistry } from '../plugins/registry.js'
 import { SlidingWindowConversationManager } from '../conversation-manager/sliding-window-conversation-manager.js'
 import { NullConversationManager } from '../conversation-manager/null-conversation-manager.js'
@@ -66,6 +70,8 @@ import {
 import { StructuredOutputTool, STRUCTURED_OUTPUT_TOOL_NAME } from '../tools/structured-output-tool.js'
 import { AgentAsTool } from './agent-as-tool.js'
 import type { AgentAsToolOptions } from './agent-as-tool.js'
+import { ToolCaller } from './tool-caller.js'
+import type { ToolCallerProxy } from './tool-caller.js'
 
 import type { z } from 'zod'
 import { SessionManager } from '../session/session-manager.js'
@@ -182,6 +188,10 @@ export type AgentConfig = {
    */
   retryStrategy?: RetryStrategy | RetryStrategy[] | null
   /**
+   * Intervention handlers evaluated in registration order at each lifecycle point.
+   */
+  interventions?: InterventionHandler[]
+  /**
    * Zod schema for structured output validation.
    */
   structuredOutputSchema?: z.ZodSchema
@@ -281,6 +291,7 @@ export class Agent implements LocalAgent, InvokableAgent {
 
   private readonly _hooksRegistry: HookRegistryImplementation
   private readonly _pluginRegistry: PluginRegistry
+  private readonly _interventionRegistry: InterventionRegistry
   private _toolRegistry: ToolRegistry
   private _mcpClients: McpClient[]
   private _initialized: boolean
@@ -297,6 +308,8 @@ export class Agent implements LocalAgent, InvokableAgent {
   _interruptState: InterruptState
   /** Strategy for executing tool calls from a single assistant turn. */
   private readonly _toolExecutor: ToolExecutorStrategy
+  /** Direct tool caller — created via {@link ToolCaller.create} factory. */
+  private readonly _toolCaller: ToolCallerProxy
 
   /**
    * Creates an instance of the Agent.
@@ -337,6 +350,8 @@ export class Agent implements LocalAgent, InvokableAgent {
 
     // Initialize hooks registry
     this._hooksRegistry = new HookRegistryImplementation()
+
+    this._interventionRegistry = new InterventionRegistry(config?.interventions ?? [], this._hooksRegistry)
 
     // `undefined` (omitted) → install the default; `null`/`[]` → explicit opt-out.
     const retryStrategies: RetryStrategy[] =
@@ -388,6 +403,11 @@ export class Agent implements LocalAgent, InvokableAgent {
     this._interruptState = new InterruptState()
 
     this._toolExecutor = config?.toolExecutor ?? 'concurrent'
+    // Pass a private helper into ToolCaller so message append + hook firing
+    // remains an internal concern of Agent (not exposed as a public method).
+    this._toolCaller = ToolCaller.create(this, (message, invocationState) =>
+      this._appendMessageAndFireHooks(message, invocationState)
+    )
 
     this._initialized = false
   }
@@ -439,28 +459,29 @@ export class Agent implements LocalAgent, InvokableAgent {
 
     await this._pluginRegistry.initialize(this)
 
+    for (const handler of this._interventionRegistry.handlers) {
+      const observer = handler as Partial<LifecycleObserver>
+      if (typeof observer.observeAgent === 'function') {
+        await observer.observeAgent(this)
+      }
+    }
+
     await this._hooksRegistry.invokeCallbacks(new InitializedEvent({ agent: this }))
 
     this._initialized = true
   }
 
   /**
-   * Acquires a lock to prevent concurrent invocations.
-   * Returns a Disposable that releases the lock when disposed.
+   * Acquires the invocation lock. Throws if an invocation is already in progress.
+   * Callers must release via try/finally with `this._isInvoking = false`.
    */
-  private acquireLock(): { [Symbol.dispose]: () => void } {
+  private acquireLock(): void {
     if (this._isInvoking) {
       throw new ConcurrentInvocationError(
         'Agent is already processing an invocation. Wait for the current invoke() or stream() call to complete before invoking again.'
       )
     }
     this._isInvoking = true
-
-    return {
-      [Symbol.dispose]: (): void => {
-        this._isInvoking = false
-      },
-    }
   }
 
   /**
@@ -471,6 +492,64 @@ export class Agent implements LocalAgent, InvokableAgent {
     if (this.isCancelled) {
       throw new CancelledError()
     }
+  }
+
+  /**
+   * Validates the per-invocation budget caps in {@link InvokeOptions.limits}.
+   * Called once at the top of `_stream` so bad inputs fail fast with a clear
+   * error instead of silently no-op'ing (`NaN`, `Infinity`) or tripping
+   * pathologically (zero swallows the user input; negative trips immediately).
+   *
+   * Each cap, when set, must be a positive finite number. Fractional values
+   * are accepted — harmless, and useful for token budgets derived from
+   * arithmetic.
+   */
+  private _validateLimits(options: InvokeOptions | undefined): void {
+    if (!options?.limits) return
+    const assertPositive = (name: string, value: number | undefined): void => {
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        throw new TypeError(`${name} must be a positive finite number, got ${value}`)
+      }
+    }
+    assertPositive('limits.turns', options.limits.turns)
+    assertPositive('limits.outputTokens', options.limits.outputTokens)
+    assertPositive('limits.totalTokens', options.limits.totalTokens)
+  }
+
+  /**
+   * Evaluates the per-invocation budget caps in {@link InvokeOptions.limits}
+   * against the current invocation's metrics. Called at the top of each
+   * agent-loop iteration, after `_throwIfCancelled` and before `startCycle`.
+   *
+   * Reads from {@link AgentMetrics.latestAgentInvocation} (scoped to the
+   * current invocation) — not `cycleCount` / `accumulatedUsage`, which are
+   * lifetime accumulators that would cause caps to fire prematurely on the
+   * second `invoke()` call against a reused agent.
+   *
+   * Priority on simultaneous trip: turns → totalTokens → outputTokens.
+   *
+   * Returns the {@link StopReason} the loop should terminate with, or
+   * `undefined` if every configured cap is still within budget.
+   */
+  private _checkLimits(options: InvokeOptions | undefined): StopReason | undefined {
+    const limits = options?.limits
+    if (!limits) return undefined
+    const invocation = this._meter.metrics.latestAgentInvocation
+    if (!invocation) return undefined
+
+    const cycleCount = invocation.cycles.length
+    const { outputTokens, totalTokens } = invocation.usage
+
+    if (limits.turns !== undefined && cycleCount >= limits.turns) {
+      return 'limitTurns'
+    }
+    if (limits.totalTokens !== undefined && totalTokens >= limits.totalTokens) {
+      return 'limitTotalTokens'
+    }
+    if (limits.outputTokens !== undefined && outputTokens >= limits.outputTokens) {
+      return 'limitOutputTokens'
+    }
+    return undefined
   }
 
   /**
@@ -485,6 +564,34 @@ export class Agent implements LocalAgent, InvokableAgent {
    */
   get toolRegistry(): ToolRegistry {
     return this._toolRegistry
+  }
+
+  /**
+   * Whether the agent is currently processing an invocation.
+   */
+  get isInvoking(): boolean {
+    return this._isInvoking
+  }
+
+  /**
+   * Direct tool calling accessor.
+   *
+   * Returns a proxy where each property is a {@link ToolHandle} with
+   * `.invoke()` and `.stream()` methods:
+   * ```typescript
+   * const result = await agent.tool.calculator!.invoke({ a: 5, b: 3 })
+   *
+   * for await (const event of agent.tool.calculator!.stream({ a: 5, b: 3 })) {
+   *   console.log('progress:', event)
+   * }
+   * ```
+   *
+   * Supports underscore-to-hyphen and case-insensitive name resolution.
+   * Results are recorded in message history by default (pass
+   * `{ recordDirectToolCall: false }` to skip).
+   */
+  get tool(): ToolCallerProxy {
+    return this._toolCaller
   }
 
   /**
@@ -600,93 +707,96 @@ export class Agent implements LocalAgent, InvokableAgent {
     args: InvokeArgs,
     options?: InvokeOptions
   ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
-    using _lock = this.acquireLock()
+    this.acquireLock()
+    try {
+      await this.initialize()
 
-    await this.initialize()
+      let currentArgs: InvokeArgs = args
 
-    let currentArgs: InvokeArgs = args
+      // Outer loop: re-enters _stream when a hook sets AfterInvocationEvent.resume.
+      // One invocation lock spans the whole resume chain.
+      while (true) {
+        // Fresh AbortController per invocation iteration, composed with any external signal.
+        this._abortController = new AbortController()
+        this._abortSignal = options?.cancelSignal
+          ? AbortSignal.any([this._abortController.signal, options.cancelSignal])
+          : this._abortController.signal
 
-    // Outer loop: re-enters _stream when a hook sets AfterInvocationEvent.resume.
-    // One invocation lock spans the whole resume chain.
-    while (true) {
-      // Fresh AbortController per invocation iteration, composed with any external signal.
-      this._abortController = new AbortController()
-      this._abortSignal = options?.cancelSignal
-        ? AbortSignal.any([this._abortController.signal, options.cancelSignal])
-        : this._abortController.signal
+        const streamGenerator = this._stream(currentArgs, options)
+        let caughtError: Error | undefined
+        let lastAfterInvocation: AfterInvocationEvent | undefined
+        let iterationResult: IteratorResult<AgentStreamEvent, AgentResult>
+        try {
+          iterationResult = await streamGenerator.next()
 
-      const streamGenerator = this._stream(currentArgs, options)
-      let caughtError: Error | undefined
-      let lastAfterInvocation: AfterInvocationEvent | undefined
-      let iterationResult: IteratorResult<AgentStreamEvent, AgentResult>
-      try {
-        iterationResult = await streamGenerator.next()
-
-        while (!iterationResult.done) {
-          try {
-            const processed = await this._invokeCallbacks(iterationResult.value)
-            if (processed instanceof AfterInvocationEvent) {
-              lastAfterInvocation = processed
-            }
-            yield processed
-            iterationResult = await streamGenerator.next()
-          } catch (error) {
-            // Throw interrupt errors back into _stream so executeTools can store the
-            // assistant message as pending execution state for resume.
-            if (error instanceof InterruptError) {
-              iterationResult = await streamGenerator.throw(error)
-            } else {
-              throw error
+          while (!iterationResult.done) {
+            try {
+              const processed = await this._invokeCallbacks(iterationResult.value)
+              if (processed instanceof AfterInvocationEvent) {
+                lastAfterInvocation = processed
+              }
+              yield processed
+              iterationResult = await streamGenerator.next()
+            } catch (error) {
+              // Throw interrupt errors back into _stream so executeTools can store the
+              // assistant message as pending execution state for resume.
+              if (error instanceof InterruptError) {
+                iterationResult = await streamGenerator.throw(error)
+              } else {
+                throw error
+              }
             }
           }
-        }
 
-        // Suppress AgentResultEvent for resumed iterations — only the final
-        // invocation in a resume chain reports an agent result.
-        if (lastAfterInvocation?.resume === undefined) {
-          yield await this._invokeCallbacks(
-            new AgentResultEvent({
-              agent: this,
-              result: iterationResult.value,
-              invocationState: iterationResult.value.invocationState,
-            })
-          )
-        }
-      } catch (error) {
-        caughtError = error as Error
-        throw error
-      } finally {
-        // Drain _stream() so cleanup hooks and printer still fire.
-        // Yield only on error (consumer may still be iterating); on a consumer
-        // break, yielding would suspend the generator and leak the lock.
-        let drainResult = await streamGenerator.return(undefined as never)
-        while (!drainResult.done) {
-          try {
-            if (caughtError) {
-              yield await this._invokeCallbacks(drainResult.value)
-            } else {
-              await this._invokeCallbacks(drainResult.value)
-            }
-          } catch (error) {
-            logger.warn(
-              `event_type=<${drainResult.value.type}>, error=<${error}> | error invoking callbacks during cleanup`
+          // Suppress AgentResultEvent for resumed iterations — only the final
+          // invocation in a resume chain reports an agent result.
+          if (lastAfterInvocation?.resume === undefined) {
+            yield await this._invokeCallbacks(
+              new AgentResultEvent({
+                agent: this,
+                result: iterationResult.value,
+                invocationState: iterationResult.value.invocationState,
+              })
             )
           }
-          drainResult = await streamGenerator.next()
+        } catch (error) {
+          caughtError = error as Error
+          throw error
+        } finally {
+          // Drain _stream() so cleanup hooks and printer still fire.
+          // Yield only on error (consumer may still be iterating); on a consumer
+          // break, yielding would suspend the generator and leak the lock.
+          let drainResult = await streamGenerator.return(undefined as never)
+          while (!drainResult.done) {
+            try {
+              if (caughtError) {
+                yield await this._invokeCallbacks(drainResult.value)
+              } else {
+                await this._invokeCallbacks(drainResult.value)
+              }
+            } catch (error) {
+              logger.warn(
+                `event_type=<${drainResult.value.type}>, error=<${error}> | error invoking callbacks during cleanup`
+              )
+            }
+            drainResult = await streamGenerator.next()
+          }
+
+          // Reset controller and signal for next iteration / invocation
+          this._abortController = new AbortController()
+          this._abortSignal = this._abortController.signal
         }
 
-        // Reset controller and signal for next iteration / invocation
-        this._abortController = new AbortController()
-        this._abortSignal = this._abortController.signal
-      }
+        // Resume only on a clean invocation — errors propagate above.
+        if (lastAfterInvocation?.resume !== undefined) {
+          currentArgs = lastAfterInvocation.resume
+          continue
+        }
 
-      // Resume only on a clean invocation — errors propagate above.
-      if (lastAfterInvocation?.resume !== undefined) {
-        currentArgs = lastAfterInvocation.resume
-        continue
+        return iterationResult.value
       }
-
-      return iterationResult.value
+    } finally {
+      this._isInvoking = false
     }
   }
 
@@ -811,6 +921,8 @@ export class Agent implements LocalAgent, InvokableAgent {
     let currentArgs: InvokeArgs | undefined = args
     let result: AgentResult | undefined
 
+    this._validateLimits(options)
+
     // Resolve structured output schema from per-invocation options or constructor config
     const structuredOutputSchema = options?.structuredOutputSchema ?? this._structuredOutputSchema
     const structuredOutputTool = structuredOutputSchema ? new StructuredOutputTool(structuredOutputSchema) : undefined
@@ -877,6 +989,18 @@ export class Agent implements LocalAgent, InvokableAgent {
       // Main agent loop - continues until model stops without requesting tools
       while (true) {
         this._throwIfCancelled()
+
+        const limitStopReason = this._checkLimits(options)
+        if (limitStopReason) {
+          result = new AgentResult({
+            stopReason: limitStopReason,
+            lastMessage: this.messages.at(-1)!,
+            traces: this._tracer.localTraces,
+            metrics: this._meter.metrics,
+            invocationState,
+          })
+          return result
+        }
 
         // Start metrics cycle tracking
         const { cycleId, startTime: cycleStartTime } = this._meter.startCycle()
@@ -2049,6 +2173,18 @@ export class Agent implements LocalAgent, InvokableAgent {
     }
 
     return estimate
+  }
+
+  /**
+   * Appends a message to the conversation history and fires MessageAddedEvent hooks.
+   *
+   * Used by {@link ToolCaller} (via the helper passed to `ToolCaller.create`) for
+   * direct tool calls that cannot yield events into the agent stream. This stays
+   * private — callers outside the agent should never directly mutate messages.
+   */
+  private async _appendMessageAndFireHooks(message: Message, invocationState: InvocationState = {}): Promise<void> {
+    this.messages.push(message)
+    await this._hooksRegistry.invokeCallbacks(new MessageAddedEvent({ agent: this, message, invocationState }))
   }
 
   /**

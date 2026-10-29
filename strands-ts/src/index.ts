@@ -15,7 +15,9 @@ export { StateStore } from './state-store.js'
 export { AgentResult } from './types/agent.js'
 export type { AgentConfig, ToolList, ToolExecutorStrategy } from './agent/agent.js'
 export type { AgentAsToolOptions } from './agent/agent-as-tool.js'
+export type { ToolCaller, ToolCallerProxy, ToolHandle, DirectToolCallOptions } from './agent/tool-caller.js'
 export type { InvocationState, InvokeArgs, InvokeOptions, LocalAgent } from './types/agent.js'
+export type { LifecycleObserver } from './types/lifecycle-observer.js'
 
 // Snapshot types
 export { SNAPSHOT_SCHEMA_VERSION } from './types/snapshot.js'
@@ -34,6 +36,7 @@ export {
   ModelThrottledError,
   ToolValidationError,
   StructuredOutputError,
+  ToolNotFoundError,
 } from './errors.js'
 
 // Interrupt system
@@ -183,6 +186,8 @@ export type {
   BedrockModelOptions,
   BedrockGuardrailConfig,
   BedrockGuardrailRedactionConfig,
+  BedrockCacheConfig,
+  BedrockCacheTTL,
 } from './models/bedrock.js'
 
 // Agent streaming event types
@@ -223,6 +228,10 @@ export type {
 
 // Plugin system
 export type { Plugin } from './plugins/index.js'
+
+// Intervention system
+export { InterventionHandler, InterventionActions } from './interventions/index.js'
+export type { OnError } from './interventions/index.js'
 
 // Retry
 export {
@@ -265,9 +274,11 @@ export type { Logger } from './logging/types.js'
 
 // MCP Client types and implementations
 export {
+  type McpClientOptions,
   type McpClientConfig,
   type McpClientCredentials,
   type McpTransport,
+  type McpCallToolOptions,
   type TasksConfig,
   type McpConnectionState,
   McpClient,
@@ -290,6 +301,11 @@ export { AgentTrace } from './telemetry/tracer.js'
 
 // Local Metrics
 export { AgentMetrics } from './telemetry/meter.js'
+
+// Sandbox
+export { Sandbox, type ExecuteOptions } from './sandbox/base.js'
+export { PosixShellSandbox } from './sandbox/posix-shell.js'
+export type { StreamType, StreamChunk, FileInfo, OutputFile, ExecutionResult } from './sandbox/types.js'
 
 // Multi-agent orchestration
 export { Graph } from './multiagent/index.js'

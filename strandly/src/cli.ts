@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 
 import { execSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 import { program } from 'commander'
 
 const ROOT = resolve(import.meta.dirname, '../..')
-const PY = `${ROOT}/strands-py`
+const PY = `${ROOT}/strands-py-wasm`
 const VENV = `${ROOT}/.venv`
 
 process.env.PYTHONPYCACHEPREFIX ??= `${ROOT}/.pycache`
@@ -15,7 +15,7 @@ program.name('strandly').description(
   `Strands monorepo development CLI
 
 Build pipeline (each step feeds the next):
-  wit/agent.wit -> strands-ts -> strands-wasm -> strands-py
+  wit/agent.wit -> strands-ts -> strands-wasm -> strands-py-wasm
 
 Most commands accept layer flags (--ts, --wasm, --py).
 No flags = run all layers.`
@@ -168,7 +168,7 @@ function run(cmd: string, opts?: { cwd?: string; env?: Record<string, string> })
 }
 
 /** Run a command with the repo-root venv on PATH. ``cwd`` defaults to
- * strands-py because most Python commands (pytest, ruff) act on that
+ * strands-py-wasm because most Python commands (pytest, ruff) act on that
  * package's source, but callers can override. */
 function py(cmd: string, opts?: { cwd?: string }): void {
   run(cmd, {
@@ -183,7 +183,7 @@ function setup(opts?: { node?: boolean; python?: boolean }): void {
   if (all || opts?.python) {
     run('python3 -m venv .venv', { cwd: ROOT })
     run(`${VENV}/bin/pip install -e .`, { cwd: ROOT })
-    run(`${VENV}/bin/pip install -e strands-py/`, { cwd: ROOT })
+    run(`${VENV}/bin/pip install -e strands-py-wasm/`, { cwd: ROOT })
   }
 }
 
@@ -210,9 +210,14 @@ function test(opts?: { py?: boolean; ts?: boolean; file?: string }): void {
 
 function check(opts?: { ts?: boolean; wasm?: boolean; py?: boolean }): void {
   const all = !opts?.ts && !opts?.wasm && !opts?.py
-  if (all || opts?.py) py('ruff check src/strands')
+  if (all || opts?.py) {
+    py('ruff check src/strands')
+    py('ruff format --check src/strands')
+    py('pyright src/strands')
+  }
   if (all || opts?.ts) run('npm run type-check -w strands-ts')
   if (all || opts?.wasm) run('npm run type-check -w strands-wasm')
+  if (all || opts?.py || opts?.wasm) generate({ check: true })
 }
 
 function fmt(opts?: { check?: boolean }): void {
@@ -241,9 +246,11 @@ function generate(opts?: { check?: boolean }): void {
     }
   }
 
-  // Generate Python types from WIT. Runs from the repo root via the
-  // shared venv (componentize-py lives there).
-  run(`${VENV}/bin/python strandly/scripts/generate_types.py`)
+  // Generate Python types from WIT via wasmtime-py's component bindgen.
+  // Output is a package: one module per WIT interface plus an __init__.py.
+  // The hand-written ``strands.types`` module re-exports the curated public
+  // subset from this private ``_generated`` package.
+  run(`${VENV}/bin/python -m wasmtime.component.bindgen wit -o strands-py-wasm/src/strands/_generated`)
 
   // Ensure TS + WASM are built first.
   if (!existsSync(join(ROOT, 'strands-wasm/dist/strands-agent.wasm'))) {
@@ -252,12 +259,13 @@ function generate(opts?: { check?: boolean }): void {
 
   if (opts?.check) {
     try {
-      execSync('git diff --quiet -- strands-wasm/generated/ strands-ts/generated/ strands-py/src/strands/_generated.py', {
-        cwd: ROOT,
-      })
+      execSync(
+        'git diff --quiet -- strands-wasm/generated/ strands-ts/generated/ strands-py-wasm/src/strands/_generated/',
+        { cwd: ROOT }
+      )
     } catch {
       console.error("error: generated files are out of date -- run 'strandly generate' and commit")
-      run('git diff --stat -- strands-wasm/generated/ strands-ts/generated/ strands-py/src/strands/_generated.py')
+      run('git diff --stat -- strands-wasm/generated/ strands-ts/generated/ strands-py-wasm/src/strands/_generated/')
       process.exit(1)
     }
   }
@@ -269,5 +277,5 @@ function clean(): void {
   } catch (e) {
     console.warn('workspace clean failed (continuing):', (e as Error).message)
   }
-  run('rm -rf .venv strands-py/target')
+  run('rm -rf .venv strands-py-wasm/target')
 }

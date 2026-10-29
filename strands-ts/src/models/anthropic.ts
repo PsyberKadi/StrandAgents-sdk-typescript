@@ -16,6 +16,9 @@ import { logger } from '../logging/logger.js'
 import { warnOnce } from '../logging/warn-once.js'
 import { MODEL_DEFAULTS, defaultMaxTokensWarningMessage, defaultModelWarningMessage } from './defaults.js'
 
+// Union of overflow phrases observed across Anthropic responses, matched
+// case-insensitively. Kept in lowercase so the comparison is a single
+// ``toLowerCase`` on the error message.
 const CONTEXT_WINDOW_OVERFLOW_ERRORS = [
   'prompt is too long',
   'max_tokens exceeded',
@@ -36,6 +39,16 @@ export interface AnthropicModelConfig extends BaseModelConfig {
   maxTokens?: number
   stopSequences?: string[]
   params?: Record<string, unknown>
+
+  /**
+   * Beta features to enable via the `anthropic-beta` header.
+   *
+   * No header is sent by default. Provide a list of beta identifiers to opt into
+   * features such as `interleaved-thinking-2025-05-14` or `mcp-client-2025-11-20`.
+   *
+   * @see https://docs.anthropic.com/en/api/beta-headers
+   */
+  betas?: string[]
 
   /**
    * Whether to use the native Anthropic countTokens API.
@@ -92,10 +105,6 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
       this._client = new Anthropic({
         ...(apiKey ? { apiKey } : {}),
         ...clientConfig,
-        defaultHeaders: {
-          ...clientConfig?.defaultHeaders,
-          'anthropic-beta': 'pdfs-2024-09-25,prompt-caching-2024-07-31',
-        },
       })
     }
   }
@@ -131,7 +140,10 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
         ...(request.tool_choice && { tool_choice: request.tool_choice }),
       }
 
-      const response = await this._client.messages.countTokens(params)
+      const requestOptions = this._buildRequestOptions()
+      const response = requestOptions
+        ? await this._client.messages.countTokens(params, requestOptions)
+        : await this._client.messages.countTokens(params)
 
       logger.debug(`total_tokens=<${response.input_tokens}> | native token count`)
       return response.input_tokens
@@ -144,7 +156,10 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
   async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
     try {
       const request = this._formatRequest(messages, options)
-      const stream = this._client.messages.stream(request)
+      const requestOptions = this._buildRequestOptions()
+      const stream = requestOptions
+        ? this._client.messages.stream(request, requestOptions)
+        : this._client.messages.stream(request)
 
       const usage = createEmptyUsage()
 
@@ -265,8 +280,8 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
     } catch (unknownError) {
       const error = normalizeError(unknownError)
 
-      const lowerMessage = error.message.toLowerCase()
-      if (CONTEXT_WINDOW_OVERFLOW_ERRORS.some((msg) => lowerMessage.includes(msg))) {
+      const lowered = error.message.toLowerCase()
+      if (CONTEXT_WINDOW_OVERFLOW_ERRORS.some((msg) => lowered.includes(msg))) {
         throw new ContextWindowOverflowError(error.message)
       }
 
@@ -279,6 +294,12 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
 
       throw error
     }
+  }
+
+  private _buildRequestOptions(): Anthropic.RequestOptions | undefined {
+    const betas = this._config.betas
+    if (!betas || betas.length === 0) return undefined
+    return { headers: { 'anthropic-beta': betas.join(',') } }
   }
 
   private _formatRequest(messages: Message[], options?: StreamOptions): Anthropic.MessageStreamParams {
@@ -444,6 +465,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
               media_type: 'application/pdf',
               data: encodeBase64(docBlock.source.bytes),
             },
+            ...(docBlock.name && { title: docBlock.name }),
           } as unknown as Anthropic.ContentBlockParam
         }
 
@@ -546,6 +568,10 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
         return 'stopSequence'
       case 'tool_use':
         return 'toolUse'
+      case 'pause_turn':
+        return 'pauseTurn'
+      case 'refusal':
+        return 'refusal'
       default:
         logger.warn(`stop_reason=<${anthropicReason}> | unknown anthropic stop reason`)
         return anthropicReason
